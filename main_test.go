@@ -1,609 +1,389 @@
-
 package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
-	"strconv"
+)
 
-	"database/sql"
-
-	_ "github.com/mattn/go-sqlite3"
+var (
+	testSessionCookie *http.Cookie
+	testUserID        int
 )
 
 func TestMain(m *testing.M) {
-	// Set up a temporary database for testing
-	db, _ = sql.Open("sqlite3", "./test.db")
-	createTables()
+	var err error
+	db, err = sql.Open("sqlite3", "./test.db")
+	if err != nil {
+		panic(err)
+	}
 
-	// Run the tests
+	if err := createTables(); err != nil {
+		panic(err)
+	}
+
+	if err := seedTestUser(); err != nil {
+		panic(err)
+	}
+
 	exitCode := m.Run()
 
-	// Clean up the temporary database
 	db.Close()
 	os.Remove("./test.db")
 
 	os.Exit(exitCode)
 }
 
-func TestCreateExpense(t *testing.T) {
+func seedTestUser() error {
+	payload := credentials{
+		Email:    "tester@example.com",
+		Password: "VerySecurePass123!",
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/register", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	registerHandler(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		return fmt.Errorf("unexpected register status: %d", rr.Code)
+	}
+
+	res := rr.Result()
+	for _, c := range res.Cookies() {
+		if c.Name == sessionCookieName {
+			copied := *c
+			testSessionCookie = &copied
+			break
+		}
+	}
+
+	if testSessionCookie == nil {
+		return fmt.Errorf("session cookie not set")
+	}
+
+	if err := db.QueryRow("SELECT id FROM users WHERE email = ?", strings.ToLower(payload.Email)).Scan(&testUserID); err != nil {
+		return err
+	}
+
+	return nil
+}
+func resetData(t *testing.T) {
+	tables := []string{"expenses", "budgets", "recurring_expenses", "incomes"}
+	for _, table := range tables {
+		if _, err := db.Exec("DELETE FROM "+table+" WHERE user_id = ?", testUserID); err != nil {
+			t.Fatalf("cleanup %s: %v", table, err)
+		}
+	}
+}
+
+func authedRequest(method, target string, payload interface{}) *http.Request {
+	var reader *bytes.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			panic(err)
+		}
+		reader = bytes.NewReader(data)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+
+	req := httptest.NewRequest(method, target, reader)
+	req.AddCookie(testSessionCookie)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req
+}
+
+func performAuthed(handler http.HandlerFunc, method, target string, payload interface{}) *httptest.ResponseRecorder {
+	req := authedRequest(method, target, payload)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	return rr
+}
+
+func callAuthed(handler authedHandler, method, target string, payload interface{}) *httptest.ResponseRecorder {
+	return performAuthed(withAuth(handler), method, target, payload)
+}
+
+func decodeBody[T any](t *testing.T, rr *httptest.ResponseRecorder) T {
+	var out T
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v (body: %s)", err, rr.Body.String())
+	}
+	return out
+}
+
+func expectStatus(t *testing.T, rr *httptest.ResponseRecorder, want int) {
+	if rr.Code != want {
+		t.Fatalf("unexpected status: got %d want %d (body: %s)", rr.Code, want, rr.Body.String())
+	}
+}
+func TestExpenseLifecycle(t *testing.T) {
+	resetData(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
 	expense := Expense{
-		Amount:   50.0,
+		Amount:   50.5,
 		Category: "Test",
-		Note:     "Test expense",
-		Date:     time.Now(),
-	}
-	body, _ := json.Marshal(expense)
-
-	req, _ := http.NewRequest("POST", "/expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(expensesHandler)
-
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusCreated {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusCreated)
+		Note:     "Initial expense",
+		Date:     now,
 	}
 
-	var createdExpense Expense
-	json.Unmarshal(rr.Body.Bytes(), &createdExpense)
-
-	if createdExpense.Amount != expense.Amount {
-		t.Errorf("handler returned unexpected body: got %v want %v",
-			createdExpense.Amount, expense.Amount)
+	createRR := callAuthed(expensesHandler, http.MethodPost, "/expenses", expense)
+	expectStatus(t, createRR, http.StatusCreated)
+	created := decodeBody[Expense](t, createRR)
+	if created.ID == 0 {
+		t.Fatalf("expected expense ID to be set")
 	}
-}
 
-func TestGetExpenses(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/expenses", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(expensesHandler)
-
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
+	listRR := callAuthed(expensesHandler, http.MethodGet, "/expenses", nil)
+	expectStatus(t, listRR, http.StatusOK)
+	list := decodeBody[[]Expense](t, listRR)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 expense, got %d", len(list))
 	}
-}
 
-func TestGetExpense(t *testing.T) {
-	// First, create an expense to get
-	expense := Expense{
-		Amount:   100.0,
-		Category: "Test Get",
-		Note:     "Test get expense",
-		Date:     time.Now(),
+	getRR := callAuthed(expenseHandler, http.MethodGet, fmt.Sprintf("/expenses/%d", created.ID), nil)
+	expectStatus(t, getRR, http.StatusOK)
+	fetched := decodeBody[Expense](t, getRR)
+	if fetched.Amount != expense.Amount {
+		t.Fatalf("expected amount %.2f got %.2f", expense.Amount, fetched.Amount)
 	}
-	body, _ := json.Marshal(expense)
 
-	req, _ := http.NewRequest("POST", "/expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(expensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdExpense Expense
-	json.Unmarshal(rr.Body.Bytes(), &createdExpense)
-
-	// Now, get the expense
-	getReq, _ := http.NewRequest("GET", "/expenses/"+strconv.Itoa(createdExpense.ID), nil)
-	getRr := httptest.NewRecorder()
-	getHandler := http.HandlerFunc(expenseHandler)
-	getHandler.ServeHTTP(getRr, getReq)
-
-	if status := getRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestUpdateExpense(t *testing.T) {
-	// First, create an expense to update
-	expense := Expense{
-		Amount:   120.0,
-		Category: "Test Update",
-		Note:     "Test update expense",
-		Date:     time.Now(),
-	}
-	body, _ := json.Marshal(expense)
-
-	req, _ := http.NewRequest("POST", "/expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(expensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdExpense Expense
-	json.Unmarshal(rr.Body.Bytes(), &createdExpense)
-
-	// Now, update the expense
 	updatedExpense := Expense{
-		Amount:   150.0,
-		Category: "Test Updated",
-		Note:     "Test updated expense",
-		Date:     time.Now(),
+		Amount:   75,
+		Category: "Updated",
+		Note:     "Updated expense",
+		Date:     now.Add(24 * time.Hour),
 	}
-	updateBody, _ := json.Marshal(updatedExpense)
 
-	updateReq, _ := http.NewRequest("PUT", "/expenses/"+strconv.Itoa(createdExpense.ID), bytes.NewBuffer(updateBody))
-	updateRr := httptest.NewRecorder()
-	updateHandler := http.HandlerFunc(expenseHandler)
-	updateHandler.ServeHTTP(updateRr, updateReq)
-
-	if status := updateRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
+	updateRR := callAuthed(expenseHandler, http.MethodPut, fmt.Sprintf("/expenses/%d", created.ID), updatedExpense)
+	expectStatus(t, updateRR, http.StatusOK)
+	updated := decodeBody[Expense](t, updateRR)
+	if updated.Category != "Updated" {
+		t.Fatalf("expected category Updated got %s", updated.Category)
 	}
-}
 
-func TestDeleteExpense(t *testing.T) {
-	// First, create an expense to delete
-	expense := Expense{
-		Amount:   200.0,
-		Category: "Test Delete",
-		Note:     "Test delete expense",
-		Date:     time.Now(),
-	}
-	body, _ := json.Marshal(expense)
+	deleteRR := callAuthed(expenseHandler, http.MethodDelete, fmt.Sprintf("/expenses/%d", created.ID), nil)
+	expectStatus(t, deleteRR, http.StatusNoContent)
 
-	req, _ := http.NewRequest("POST", "/expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(expensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdExpense Expense
-	json.Unmarshal(rr.Body.Bytes(), &createdExpense)
-
-	// Now, delete the expense
-	deleteReq, _ := http.NewRequest("DELETE", "/expenses/"+strconv.Itoa(createdExpense.ID), nil)
-	deleteRr := httptest.NewRecorder()
-	deleteHandler := http.HandlerFunc(expenseHandler)
-	deleteHandler.ServeHTTP(deleteRr, deleteReq)
-
-	if status := deleteRr.Code; status != http.StatusNoContent {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusNoContent)
+	missingRR := callAuthed(expenseHandler, http.MethodGet, fmt.Sprintf("/expenses/%d", created.ID), nil)
+	if missingRR.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after delete, got %d", missingRR.Code)
 	}
 }
+func TestExpenseAggregates(t *testing.T) {
+	resetData(t)
 
-func TestCreateBudget(t *testing.T) {
+	base := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	expenses := []Expense{
+		{Amount: 120, Category: "Food", Note: "January food", Date: base},
+		{Amount: 80, Category: "Travel", Note: "February travel", Date: base.AddDate(0, 1, 0)},
+		{Amount: 30, Category: "Food", Note: "January snack", Date: base.Add(48 * time.Hour)},
+	}
+
+	for _, e := range expenses {
+		rr := callAuthed(expensesHandler, http.MethodPost, "/expenses", e)
+		expectStatus(t, rr, http.StatusCreated)
+	}
+
+	monthRR := callAuthed(aggregatesHandler, http.MethodGet, "/expenses/aggregates?query=totals_by_month", nil)
+	expectStatus(t, monthRR, http.StatusOK)
+	totalsByMonth := decodeBody[map[string]float64](t, monthRR)
+	if len(totalsByMonth) != 2 {
+		t.Fatalf("expected totals for 2 months, got %d", len(totalsByMonth))
+	}
+	if totalsByMonth["2024-01"] != 150 {
+		t.Fatalf("unexpected January total: %.2f", totalsByMonth["2024-01"])
+	}
+
+	categoryRR := callAuthed(aggregatesHandler, http.MethodGet, "/expenses/aggregates?query=totals_by_category", nil)
+	expectStatus(t, categoryRR, http.StatusOK)
+	totalsByCategory := decodeBody[map[string]float64](t, categoryRR)
+	if len(totalsByCategory) != 2 {
+		t.Fatalf("expected totals for 2 categories, got %d", len(totalsByCategory))
+	}
+	if totalsByCategory["Food"] != 150 {
+		t.Fatalf("unexpected Food total: %.2f", totalsByCategory["Food"])
+	}
+}
+func TestBudgetLifecycle(t *testing.T) {
+	resetData(t)
+
+	start := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
 	budget := Budget{
-		Category:  "Test Budget",
-		Amount:    500.0,
-		StartDate: time.Now(),
-		EndDate:   time.Now().AddDate(0, 1, 0),
+		Category:  "Utilities",
+		Amount:    200,
+		StartDate: start,
+		EndDate:   start.AddDate(0, 1, 0),
 	}
-	body, _ := json.Marshal(budget)
 
-	req, _ := http.NewRequest("POST", "/budgets", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(budgetsHandler)
+	createRR := callAuthed(budgetsHandler, http.MethodPost, "/budgets", budget)
+	expectStatus(t, createRR, http.StatusCreated)
+	created := decodeBody[Budget](t, createRR)
 
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusCreated {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusCreated)
+	listRR := callAuthed(budgetsHandler, http.MethodGet, "/budgets", nil)
+	expectStatus(t, listRR, http.StatusOK)
+	list := decodeBody[[]Budget](t, listRR)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 budget, got %d", len(list))
 	}
+
+	getRR := callAuthed(budgetHandler, http.MethodGet, fmt.Sprintf("/budgets/%d", created.ID), nil)
+	expectStatus(t, getRR, http.StatusOK)
+	fetched := decodeBody[Budget](t, getRR)
+	if fetched.Category != budget.Category {
+		t.Fatalf("expected category %s got %s", budget.Category, fetched.Category)
+	}
+
+	updated := Budget{
+		Category:  "Utilities",
+		Amount:    250,
+		StartDate: budget.StartDate,
+		EndDate:   budget.EndDate.AddDate(0, 0, 15),
+	}
+
+	updateRR := callAuthed(budgetHandler, http.MethodPut, fmt.Sprintf("/budgets/%d", created.ID), updated)
+	expectStatus(t, updateRR, http.StatusOK)
+	updatedResp := decodeBody[Budget](t, updateRR)
+	if updatedResp.Amount != 250 {
+		t.Fatalf("expected amount 250 got %.2f", updatedResp.Amount)
+	}
+
+	deleteRR := callAuthed(budgetHandler, http.MethodDelete, fmt.Sprintf("/budgets/%d", created.ID), nil)
+	expectStatus(t, deleteRR, http.StatusNoContent)
 }
+func TestRecurringExpenseLifecycle(t *testing.T) {
+	resetData(t)
 
-func TestGetBudgets(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/budgets", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(budgetsHandler)
-
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestGetBudget(t *testing.T) {
-	// First, create a budget to get
-	budget := Budget{
-		Category:  "Test Get Budget",
-		Amount:    600.0,
-		StartDate: time.Now(),
-		EndDate:   time.Now().AddDate(0, 1, 0),
-	}
-	body, _ := json.Marshal(budget)
-
-	req, _ := http.NewRequest("POST", "/budgets", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(budgetsHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdBudget Budget
-	json.Unmarshal(rr.Body.Bytes(), &createdBudget)
-
-	// Now, get the budget
-	getReq, _ := http.NewRequest("GET", "/budgets/"+strconv.Itoa(createdBudget.ID), nil)
-	getRr := httptest.NewRecorder()
-	getHandler := http.HandlerFunc(budgetHandler)
-	getHandler.ServeHTTP(getRr, getReq)
-
-	if status := getRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestUpdateBudget(t *testing.T) {
-	// First, create a budget to update
-	budget := Budget{
-		Category:  "Test Update Budget",
-		Amount:    700.0,
-		StartDate: time.Now(),
-		EndDate:   time.Now().AddDate(0, 1, 0),
-	}
-	body, _ := json.Marshal(budget)
-
-	req, _ := http.NewRequest("POST", "/budgets", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(budgetsHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdBudget Budget
-	json.Unmarshal(rr.Body.Bytes(), &createdBudget)
-
-	// Now, update the budget
-	updatedBudget := Budget{
-		Category:  "Test Updated Budget",
-		Amount:    800.0,
-		StartDate: time.Now(),
-		EndDate:   time.Now().AddDate(0, 1, 0),
-	}
-	updateBody, _ := json.Marshal(updatedBudget)
-
-	updateReq, _ := http.NewRequest("PUT", "/budgets/"+strconv.Itoa(createdBudget.ID), bytes.NewBuffer(updateBody))
-	updateRr := httptest.NewRecorder()
-	updateHandler := http.HandlerFunc(budgetHandler)
-	updateHandler.ServeHTTP(updateRr, updateReq)
-
-	if status := updateRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestDeleteBudget(t *testing.T) {
-	// First, create a budget to delete
-	budget := Budget{
-		Category:  "Test Delete Budget",
-		Amount:    900.0,
-		StartDate: time.Now(),
-		EndDate:   time.Now().AddDate(0, 1, 0),
-	}
-	body, _ := json.Marshal(budget)
-
-	req, _ := http.NewRequest("POST", "/budgets", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(budgetsHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdBudget Budget
-	json.Unmarshal(rr.Body.Bytes(), &createdBudget)
-
-	// Now, delete the budget
-	deleteReq, _ := http.NewRequest("DELETE", "/budgets/"+strconv.Itoa(createdBudget.ID), nil)
-	deleteRr := httptest.NewRecorder()
-	deleteHandler := http.HandlerFunc(budgetHandler)
-	deleteHandler.ServeHTTP(deleteRr, deleteReq)
-
-	if status := deleteRr.Code; status != http.StatusNoContent {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusNoContent)
-	}
-}
-
-func TestCreateIncome(t *testing.T) {
-	income := Income{
-		Amount: 1000.0,
-		Source: "Test Income",
-		Note:   "Test income note",
-		Date:   time.Now(),
-	}
-	body, _ := json.Marshal(income)
-
-	req, _ := http.NewRequest("POST", "/incomes", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomesHandler)
-
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusCreated {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusCreated)
-	}
-}
-
-func TestGetIncomes(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/incomes", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomesHandler)
-
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestGetIncome(t *testing.T) {
-	// First, create an income to get
-	income := Income{
-		Amount: 1100.0,
-		Source: "Test Get Income",
-		Note:   "Test get income note",
-		Date:   time.Now(),
-	}
-	body, _ := json.Marshal(income)
-
-	req, _ := http.NewRequest("POST", "/incomes", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdIncome Income
-	json.Unmarshal(rr.Body.Bytes(), &createdIncome)
-
-	// Now, get the income
-	getReq, _ := http.NewRequest("GET", "/incomes/"+strconv.Itoa(createdIncome.ID), nil)
-	getRr := httptest.NewRecorder()
-	getHandler := http.HandlerFunc(incomeHandler)
-	getHandler.ServeHTTP(getRr, getReq)
-
-	if status := getRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestUpdateIncome(t *testing.T) {
-	// First, create an income to update
-	income := Income{
-		Amount: 1200.0,
-		Source: "Test Update Income",
-		Note:   "Test update income note",
-		Date:   time.Now(),
-	}
-	body, _ := json.Marshal(income)
-
-	req, _ := http.NewRequest("POST", "/incomes", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdIncome Income
-	json.Unmarshal(rr.Body.Bytes(), &createdIncome)
-
-	// Now, update the income
-	updatedIncome := Income{
-		Amount: 1300.0,
-		Source: "Test Updated Income",
-		Note:   "Test updated income note",
-		Date:   time.Now(),
-	}
-	updateBody, _ := json.Marshal(updatedIncome)
-
-	updateReq, _ := http.NewRequest("PUT", "/incomes/"+strconv.Itoa(createdIncome.ID), bytes.NewBuffer(updateBody))
-	updateRr := httptest.NewRecorder()
-	updateHandler := http.HandlerFunc(incomeHandler)
-	updateHandler.ServeHTTP(updateRr, updateReq)
-
-	if status := updateRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestDeleteIncome(t *testing.T) {
-	// First, create an income to delete
-	income := Income{
-		Amount: 1400.0,
-		Source: "Test Delete Income",
-		Note:   "Test delete income note",
-		Date:   time.Now(),
-	}
-	body, _ := json.Marshal(income)
-
-	req, _ := http.NewRequest("POST", "/incomes", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdIncome Income
-	json.Unmarshal(rr.Body.Bytes(), &createdIncome)
-
-	// Now, delete the income
-	deleteReq, _ := http.NewRequest("DELETE", "/incomes/"+strconv.Itoa(createdIncome.ID), nil)
-	deleteRr := httptest.NewRecorder()
-	deleteHandler := http.HandlerFunc(incomeHandler)
-	deleteHandler.ServeHTTP(deleteRr, deleteReq)
-
-	if status := deleteRr.Code; status != http.StatusNoContent {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusNoContent)
-	}
-}
-
-func TestCreateRecurringExpense(t *testing.T) {
-	recurringExpense := RecurringExpense{
-		Amount:      100.0,
-		Category:    "Test Recurring",
-		Note:        "Test recurring expense",
+	next := time.Now().UTC().Truncate(time.Second)
+	recurring := RecurringExpense{
+		Amount:      45,
+		Category:    "Subscription",
+		Note:        "Monthly service",
 		Frequency:   "monthly",
-		NextDueDate: time.Now(),
+		NextDueDate: next,
 	}
-	body, _ := json.Marshal(recurringExpense)
 
-	req, _ := http.NewRequest("POST", "/recurring-expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(recurringExpensesHandler)
+	createRR := callAuthed(recurringExpensesHandler, http.MethodPost, "/recurring-expenses", recurring)
+	expectStatus(t, createRR, http.StatusCreated)
+	created := decodeBody[RecurringExpense](t, createRR)
 
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusCreated {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusCreated)
+	listRR := callAuthed(recurringExpensesHandler, http.MethodGet, "/recurring-expenses", nil)
+	expectStatus(t, listRR, http.StatusOK)
+	list := decodeBody[[]RecurringExpense](t, listRR)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 recurring expense, got %d", len(list))
 	}
-}
 
-func TestGetRecurringExpenses(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/recurring-expenses", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(recurringExpensesHandler)
+	getRR := callAuthed(recurringExpenseHandler, http.MethodGet, fmt.Sprintf("/recurring-expenses/%d", created.ID), nil)
+	expectStatus(t, getRR, http.StatusOK)
 
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestGetRecurringExpense(t *testing.T) {
-	// First, create a recurring expense to get
-	recurringExpense := RecurringExpense{
-		Amount:      150.0,
-		Category:    "Test Get Recurring",
-		Note:        "Test get recurring expense",
-		Frequency:   "weekly",
-		NextDueDate: time.Now(),
-	}
-	body, _ := json.Marshal(recurringExpense)
-
-	req, _ := http.NewRequest("POST", "/recurring-expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(recurringExpensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdRecurringExpense RecurringExpense
-	json.Unmarshal(rr.Body.Bytes(), &createdRecurringExpense)
-
-	// Now, get the recurring expense
-	getReq, _ := http.NewRequest("GET", "/recurring-expenses/"+strconv.Itoa(createdRecurringExpense.ID), nil)
-	getRr := httptest.NewRecorder()
-	getHandler := http.HandlerFunc(recurringExpenseHandler)
-	getHandler.ServeHTTP(getRr, getReq)
-
-	if status := getRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestUpdateRecurringExpense(t *testing.T) {
-	// First, create a recurring expense to update
-	recurringExpense := RecurringExpense{
-		Amount:      200.0,
-		Category:    "Test Update Recurring",
-		Note:        "Test update recurring expense",
-		Frequency:   "daily",
-		NextDueDate: time.Now(),
-	}
-	body, _ := json.Marshal(recurringExpense)
-
-	req, _ := http.NewRequest("POST", "/recurring-expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(recurringExpensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdRecurringExpense RecurringExpense
-	json.Unmarshal(rr.Body.Bytes(), &createdRecurringExpense)
-
-	// Now, update the recurring expense
-	updatedRecurringExpense := RecurringExpense{
-		Amount:      250.0,
-		Category:    "Test Updated Recurring",
-		Note:        "Test updated recurring expense",
-		Frequency:   "monthly",
-		NextDueDate: time.Now(),
-	}
-	updateBody, _ := json.Marshal(updatedRecurringExpense)
-
-	updateReq, _ := http.NewRequest("PUT", "/recurring-expenses/"+strconv.Itoa(createdRecurringExpense.ID), bytes.NewBuffer(updateBody))
-	updateRr := httptest.NewRecorder()
-	updateHandler := http.HandlerFunc(recurringExpenseHandler)
-	updateHandler.ServeHTTP(updateRr, updateReq)
-
-	if status := updateRr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
-	}
-}
-
-func TestDeleteRecurringExpense(t *testing.T) {
-	// First, create a recurring expense to delete
-	recurringExpense := RecurringExpense{
-		Amount:      300.0,
-		Category:    "Test Delete Recurring",
-		Note:        "Test delete recurring expense",
+	updated := RecurringExpense{
+		Amount:      60,
+		Category:    "Subscription",
+		Note:        "Monthly service upgraded",
 		Frequency:   "yearly",
-		NextDueDate: time.Now(),
+		NextDueDate: next.AddDate(0, 1, 0),
 	}
-	body, _ := json.Marshal(recurringExpense)
 
-	req, _ := http.NewRequest("POST", "/recurring-expenses", bytes.NewBuffer(body))
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(recurringExpensesHandler)
-	handler.ServeHTTP(rr, req)
-
-	var createdRecurringExpense RecurringExpense
-	json.Unmarshal(rr.Body.Bytes(), &createdRecurringExpense)
-
-	// Now, delete the recurring expense
-	deleteReq, _ := http.NewRequest("DELETE", "/recurring-expenses/"+strconv.Itoa(createdRecurringExpense.ID), nil)
-	deleteRr := httptest.NewRecorder()
-	deleteHandler := http.HandlerFunc(recurringExpenseHandler)
-	deleteHandler.ServeHTTP(deleteRr, deleteReq)
-
-	if status := deleteRr.Code; status != http.StatusNoContent {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusNoContent)
+	updateRR := callAuthed(recurringExpenseHandler, http.MethodPut, fmt.Sprintf("/recurring-expenses/%d", created.ID), updated)
+	expectStatus(t, updateRR, http.StatusOK)
+	updatedResp := decodeBody[RecurringExpense](t, updateRR)
+	if updatedResp.Frequency != "yearly" {
+		t.Fatalf("expected yearly frequency")
 	}
+
+	deleteRR := callAuthed(recurringExpenseHandler, http.MethodDelete, fmt.Sprintf("/recurring-expenses/%d", created.ID), nil)
+	expectStatus(t, deleteRR, http.StatusNoContent)
 }
+func TestIncomeLifecycle(t *testing.T) {
+	resetData(t)
 
-func TestAggregatesHandler(t *testing.T) {
-	// Test totals_by_month
-	req, _ := http.NewRequest("GET", "/expenses/aggregates?query=totals_by_month", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(aggregatesHandler)
-	handler.ServeHTTP(rr, req)
-
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code for totals_by_month: got %v want %v",
-			status, http.StatusOK)
+	now := time.Now().UTC().Truncate(time.Second)
+	income := Income{
+		Amount: 900,
+		Source: "Salary",
+		Note:   "Monthly salary",
+		Date:   now,
 	}
 
-	// Test totals_by_category
-	req, _ = http.NewRequest("GET", "/expenses/aggregates?query=totals_by_category", nil)
-	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	createRR := callAuthed(incomesHandler, http.MethodPost, "/incomes", income)
+	expectStatus(t, createRR, http.StatusCreated)
+	created := decodeBody[Income](t, createRR)
 
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code for totals_by_category: got %v want %v",
-			status, http.StatusOK)
+	listRR := callAuthed(incomesHandler, http.MethodGet, "/incomes", nil)
+	expectStatus(t, listRR, http.StatusOK)
+	list := decodeBody[[]Income](t, listRR)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 income, got %d", len(list))
 	}
+
+	getRR := callAuthed(incomeHandler, http.MethodGet, fmt.Sprintf("/incomes/%d", created.ID), nil)
+	expectStatus(t, getRR, http.StatusOK)
+
+	updated := Income{
+		Amount: 950,
+		Source: "Salary",
+		Note:   "Salary with bonus",
+		Date:   now.AddDate(0, 0, 1),
+	}
+
+	updateRR := callAuthed(incomeHandler, http.MethodPut, fmt.Sprintf("/incomes/%d", created.ID), updated)
+	expectStatus(t, updateRR, http.StatusOK)
+	updatedResp := decodeBody[Income](t, updateRR)
+	if updatedResp.Amount != 950 {
+		t.Fatalf("expected amount 950 got %.2f", updatedResp.Amount)
+	}
+
+	deleteRR := callAuthed(incomeHandler, http.MethodDelete, fmt.Sprintf("/incomes/%d", created.ID), nil)
+	expectStatus(t, deleteRR, http.StatusNoContent)
 }
+func TestIncomeVsExpenseReport(t *testing.T) {
+	resetData(t)
 
-func TestIncomeVsExpenseReportHandler(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/reports/income-vs-expense", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(incomeVsExpenseReportHandler)
+	base := time.Date(2024, 4, 1, 0, 0, 0, 0, time.UTC)
 
-	handler.ServeHTTP(rr, req)
+	incomes := []Income{
+		{Amount: 1500, Source: "Salary", Note: "April salary", Date: base},
+		{Amount: 300, Source: "Freelance", Note: "Side gig", Date: base.AddDate(0, 1, 0)},
+	}
+	expenses := []Expense{
+		{Amount: 600, Category: "Rent", Note: "April rent", Date: base.AddDate(0, 0, 2)},
+		{Amount: 200, Category: "Groceries", Note: "May groceries", Date: base.AddDate(0, 1, 5)},
+	}
 
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
+	for _, income := range incomes {
+		rr := callAuthed(incomesHandler, http.MethodPost, "/incomes", income)
+		expectStatus(t, rr, http.StatusCreated)
+	}
+	for _, expense := range expenses {
+		rr := callAuthed(expensesHandler, http.MethodPost, "/expenses", expense)
+		expectStatus(t, rr, http.StatusCreated)
+	}
+
+	reportRR := callAuthed(incomeVsExpenseReportHandler, http.MethodGet, "/reports/income-vs-expense", nil)
+	expectStatus(t, reportRR, http.StatusOK)
+	report := decodeBody[[]MonthlyReport](t, reportRR)
+	if len(report) != 2 {
+		t.Fatalf("expected report for 2 months, got %d", len(report))
+	}
+
+	if report[0].Income <= 0 || report[0].Expense <= 0 {
+		t.Fatalf("expected positive totals in report: %+v", report)
 	}
 }
