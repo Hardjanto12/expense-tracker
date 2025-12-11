@@ -24,12 +24,13 @@ import (
 )
 
 type Expense struct {
-	ID       int       `json:"id"`
-	Amount   float64   `json:"amount"`
-	Category string    `json:"category"`
-	Note     string    `json:"note"`
-	Date     time.Time `json:"date"`
-	UserID   int       `json:"-"`
+	ID        int       `json:"id"`
+	Amount    float64   `json:"amount"`
+	Category  string    `json:"category"`
+	Note      string    `json:"note"`
+	Date      time.Time `json:"date"`
+	AccountID *int      `json:"account_id"` // Optional
+	UserID    int       `json:"-"`
 }
 
 type Budget struct {
@@ -52,12 +53,21 @@ type RecurringExpense struct {
 }
 
 type Income struct {
-	ID     int       `json:"id"`
-	Amount float64   `json:"amount"`
-	Source string    `json:"source"`
-	Note   string    `json:"note"`
-	Date   time.Time `json:"date"`
-	UserID int       `json:"-"`
+	ID        int       `json:"id"`
+	Amount    float64   `json:"amount"`
+	Source    string    `json:"source"`
+	Note      string    `json:"note"`
+	Date      time.Time `json:"date"`
+	AccountID *int      `json:"account_id"` // Optional for backward compatibility/flexibility
+	UserID    int       `json:"-"`
+}
+
+type Account struct {
+	ID      int     `json:"id"`
+	Name    string  `json:"name"`
+	Type    string  `json:"type"` // e.g., "Cash", "Bank", "E-Wallet"
+	Balance float64 `json:"balance"`
+	UserID  int     `json:"-"`
 }
 
 type MonthlyReport struct {
@@ -103,6 +113,10 @@ func main() {
 		log.Fatalf("failed to initialize database: %v", err)
 	}
 
+	if err := ensureAccountColumns(); err != nil {
+		log.Fatalf("failed to migrate database (accounts): %v", err)
+	}
+
 	http.HandleFunc("/auth/register", registerHandler)
 	http.HandleFunc("/auth/login", loginHandler)
 	http.HandleFunc("/auth/logout", logoutHandler)
@@ -117,6 +131,8 @@ func main() {
 	http.HandleFunc("/incomes", withAuth(incomesHandler))
 	http.HandleFunc("/incomes/", withAuth(incomeHandler))
 	http.HandleFunc("/reports/income-vs-expense", withAuth(incomeVsExpenseReportHandler))
+	http.HandleFunc("/accounts", withAuth(accountsHandler))
+	http.HandleFunc("/accounts/", withAuth(accountHandler))
 
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
@@ -126,8 +142,8 @@ func main() {
 		}
 	}()
 
-	log.Println("Server starting on port 8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Println("Server starting on port 8090...")
+	log.Fatal(http.ListenAndServe(":8090", nil))
 }
 func createTables() error {
 	userTableStmt := `
@@ -140,6 +156,20 @@ func createTables() error {
     `
 	if _, err := db.Exec(userTableStmt); err != nil {
 		return fmt.Errorf("create users table: %w", err)
+	}
+
+	accountTableStmt := `
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        balance REAL NOT NULL DEFAULT 0,
+        user_id INTEGER NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    `
+	if _, err := db.Exec(accountTableStmt); err != nil {
+		return fmt.Errorf("create accounts table: %w", err)
 	}
 
 	sessionTableStmt := `
@@ -226,6 +256,40 @@ func createTables() error {
 		}
 	}
 
+	return nil
+}
+
+func ensureAccountColumns() error {
+	tables := []string{"expenses", "incomes"}
+	for _, table := range tables {
+		rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+		if err != nil {
+			return fmt.Errorf("inspect %s schema: %w", table, err)
+		}
+
+		hasAccountID := false
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s schema: %w", table, err)
+			}
+			if strings.EqualFold(name, "account_id") {
+				hasAccountID = true
+			}
+		}
+		rows.Close()
+
+		if !hasAccountID {
+			alter := fmt.Sprintf("ALTER TABLE %s ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL", table)
+			if _, err := db.Exec(alter); err != nil {
+				return fmt.Errorf("add account_id to %s: %w", table, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -712,21 +776,53 @@ func createExpense(w http.ResponseWriter, r *http.Request, userID int) {
 		e.Date = e.Date.UTC()
 	}
 
-	stmt, err := db.Prepare("INSERT INTO expenses(amount, category, note, date, user_id) VALUES(?, ?, ?, ?, ?)")
+	if e.AccountID == nil || *e.AccountID == 0 {
+		http.Error(w, "Account is required", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
 	if err != nil {
+		log.Printf("tx begin error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO expenses(amount, category, note, date, user_id, account_id) VALUES(?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer stmt.Close()
 
-	res, err := stmt.Exec(e.Amount, e.Category, e.Note, e.Date.Format(timeFormat), userID)
+	res, err := stmt.Exec(e.Amount, e.Category, e.Note, e.Date.Format(timeFormat), userID, e.AccountID)
 	if err != nil {
+		tx.Rollback()
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	id, err := res.LastInsertId()
 	if err != nil {
+		tx.Rollback()
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Update Account Balance if linked
+	if e.AccountID != nil {
+		_, err := tx.Exec("UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?", e.Amount, *e.AccountID, userID)
+		if err != nil {
+			tx.Rollback()
+			log.Printf("failed to update account balance: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("tx commit error: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -1460,21 +1556,53 @@ func createIncome(w http.ResponseWriter, r *http.Request, userID int) {
 		i.Date = i.Date.UTC()
 	}
 
-	stmt, err := db.Prepare("INSERT INTO incomes(amount, source, note, date, user_id) VALUES(?, ?, ?, ?, ?)")
+	if i.AccountID == nil || *i.AccountID == 0 {
+		http.Error(w, "Account is required", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
 	if err != nil {
+		log.Printf("tx begin error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO incomes(amount, source, note, date, user_id, account_id) VALUES(?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 	defer stmt.Close()
 
-	res, err := stmt.Exec(i.Amount, i.Source, i.Note, i.Date.Format(timeFormat), userID)
+	res, err := stmt.Exec(i.Amount, i.Source, i.Note, i.Date.Format(timeFormat), userID, i.AccountID)
 	if err != nil {
+		tx.Rollback()
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	id, err := res.LastInsertId()
 	if err != nil {
+		tx.Rollback()
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Update Account Balance if linked
+	if i.AccountID != nil {
+		_, err := tx.Exec("UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?", i.Amount, *i.AccountID, userID)
+		if err != nil {
+			tx.Rollback()
+			log.Printf("failed to update account balance: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("tx commit error: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -1575,6 +1703,147 @@ func deleteIncome(w http.ResponseWriter, userID, id int) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// Account Handlers
+
+func accountsHandler(w http.ResponseWriter, r *http.Request, userID int) {
+	switch r.Method {
+	case http.MethodGet:
+		getAccounts(w, userID)
+	case http.MethodPost:
+		createAccount(w, r, userID)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func accountHandler(w http.ResponseWriter, r *http.Request, userID int) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/accounts/")
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id <= 0 {
+		http.Error(w, "Invalid account ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		updateAccount(w, r, userID, id)
+	case http.MethodDelete:
+		deleteAccount(w, userID, id)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func getAccounts(w http.ResponseWriter, userID int) {
+	rows, err := db.Query("SELECT id, name, type, balance FROM accounts WHERE user_id = ?", userID)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var accounts []Account
+	for rows.Next() {
+		var a Account
+		if err := rows.Scan(&a.ID, &a.Name, &a.Type, &a.Balance); err != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		a.UserID = userID
+		accounts = append(accounts, a)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(accounts)
+}
+
+func createAccount(w http.ResponseWriter, r *http.Request, userID int) {
+	var a Account
+	if !decodeJSONBody(w, r, &a) {
+		return
+	}
+
+	res, err := db.Exec("INSERT INTO accounts(name, type, balance, user_id) VALUES(?, ?, ?, ?)", a.Name, a.Type, a.Balance, userID)
+	if err != nil {
+		log.Printf("create account error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	id, err := res.LastInsertId()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	a.ID = int(id)
+	a.UserID = userID
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(a)
+}
+
+func updateAccount(w http.ResponseWriter, r *http.Request, userID, id int) {
+	var a Account
+	if !decodeJSONBody(w, r, &a) {
+		return
+	}
+
+	// Note: Updating balance directly matches user input, though implies manual adjustment
+	res, err := db.Exec("UPDATE accounts SET name = ?, type = ?, balance = ? WHERE id = ? AND user_id = ?", a.Name, a.Type, a.Balance, id, userID)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if rowsAffected == 0 {
+		http.Error(w, "Account not found", http.StatusNotFound)
+		return
+	}
+
+	a.ID = id
+	a.UserID = userID
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(a)
+}
+
+func deleteAccount(w http.ResponseWriter, userID, id int) {
+	// Optional: Check if used in transactions? For now, we rely on ON DELETE SET NULL for foreign keys if we configured that, but sqlite default might be restricted
+	// Actually, the PRAGMA foreign_keys = ON is set.
+	// But let's just delete. If there are transactions, they might prevent deletion if we had strict constraints, but in ensureAccountColumns we used ON DELETE SET NULL?
+	// Ah, in ensureAccountColumns I used `REFERENCES accounts(id) ON DELETE SET NULL`. So it's safe.
+
+	res, err := db.Exec("DELETE FROM accounts WHERE id = ? AND user_id = ?", id, userID)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if rowsAffected == 0 {
+		http.Error(w, "Account not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func incomeVsExpenseReportHandler(w http.ResponseWriter, r *http.Request, userID int) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1646,7 +1915,7 @@ func incomeVsExpenseReportHandler(w http.ResponseWriter, r *http.Request, userID
 	json.NewEncoder(w).Encode(result)
 }
 func parseTimestamp(value string) (time.Time, error) {
-	layouts := []string{timeFormat, time.RFC3339, time.RFC3339Nano}
+	layouts := []string{timeFormat, time.RFC3339, time.RFC3339Nano, "2006-01-02"}
 	for _, layout := range layouts {
 		if ts, err := time.Parse(layout, value); err == nil {
 			return ts.UTC(), nil
